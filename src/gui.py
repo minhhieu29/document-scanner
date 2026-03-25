@@ -9,6 +9,8 @@ import docx
 import fitz  
 from utils import export_to_excel
 from concurrent.futures import ThreadPoolExecutor 
+import google.generativeai as genai
+import win32com.client
 
 class DocumentScanner:
     def __init__(self):
@@ -28,9 +30,12 @@ class DocumentScanner:
         content = ""
         ext = Path(file_path).suffix.lower()
         try:
-            if ext == '.txt' or ext == '.md':
+            # 1. Đọc file Text và Markdown
+            if ext in ['.txt', '.md']:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
+            
+            # 2. Đọc file Word mới (.docx)
             elif ext == '.docx':
                 doc = docx.Document(file_path)
                 full_text = [para.text for para in doc.paragraphs]
@@ -39,10 +44,26 @@ class DocumentScanner:
                         for cell in row.cells:
                             full_text.append(cell.text)
                 content = "\n".join(full_text)
+            
+            # 3. Đọc file Word cũ (.doc) - Cần cài pywin32
+            elif ext == '.doc':
+                import win32com.client
+                word = win32com.client.Dispatch("Word.Application")
+                word.Visible = False # Chạy ngầm không hiện cửa sổ Word
+                doc = word.Documents.Open(str(Path(file_path).absolute()))
+                content = doc.Content.Text
+                doc.Close()
+                word.Quit()
+            
+            # 4. Đọc file PDF
             elif ext == '.pdf':
                 with fitz.open(file_path) as doc:
                     content = "".join([page.get_text() for page in doc])
-        except: pass
+                    
+        except Exception as e: 
+            print(f"Lỗi khi đọc file {file_path}: {e}")
+            pass
+            
         return content.lower()
 
     def scan_directory(self, root_path):
@@ -120,21 +141,19 @@ class App(ctk.CTk):
     def setup_treeview(self):
         style = ttk.Style()
         style.theme_use("default")
-        # font=("Segoe UI", 12) là chỉnh chữ trong các hàng của bảng
         style.configure("Treeview", 
                         background="#252526", 
                         foreground="#cccccc", 
                         fieldbackground="#252526", 
-                        rowheight=35, # Tăng chiều cao hàng lên một chút cho thoáng
+                        rowheight=35, 
                         font=("Segoe UI", 12)) 
         
-        # font=("Segoe UI", 13, "bold") là chỉnh chữ ở cái tiêu đề cột (STT, Tên File...)
         style.configure("Treeview.Heading", 
                         background="#2d2d2d", 
                         foreground="white", 
                         relief="flat", 
                         font=("Segoe UI", 13, "bold"))
-        # ------------------------
+       
 
         style.map("Treeview", background=[('selected', "#007acc")])
 
@@ -164,12 +183,14 @@ class App(ctk.CTk):
         self.context_menu.add_command(label="Mở File", command=self.open_file_event)
         self.context_menu.add_command(label="Mở thư mục chứa file", command=self.open_folder_location)
         self.context_menu.add_command(label="Copy đường dẫn", command=self.copy_file_path)
+        self.context_menu.add_separator() 
+        self.context_menu.add_command(label=" Tóm tắt nội dung (AI)", command=self.ai_summarize_event)
 
         self.scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscroll=self.scrollbar.set)
         self.scrollbar.grid(row=0, column=1, sticky="ns", pady=10)
 
-    # --- HÀM XỬ LÝ (GIỮ NGUYÊN) ---
+    # HÀM XỬ LÝ 
     def show_context_menu(self, event):
         item = self.tree.identify_row(event.y)
         if item:
@@ -253,6 +274,63 @@ class App(ctk.CTk):
     def export_data(self):
         export_to_excel(self.results, "report.xlsx")
         messagebox.showinfo("Xong", "Đã xuất Excel!")
+
+    def ai_summarize_event(self):
+        selected = self.tree.selection()
+        if not selected: return
+        
+        
+        item_data = self.tree.item(selected)
+        file_name = item_data['values'][1].strip()
+        file_path = ""
+        for res in self.results:
+            if res['name'] == file_name:
+                file_path = res['path']
+                break
+        
+        if not file_path: return
+
+        
+        content = self.scanner.read_file_content(file_path)
+        if not content or len(content) < 20:
+            messagebox.showwarning("!", "File không có nội dung hoặc quá ngắn để tóm tắt!")
+            return
+
+        
+        self.status_label.configure(text=" AI đang đọc và tóm tắt...")
+        threading.Thread(target=self.run_ai_logic, args=(content,), daemon=True).start()
+
+    def run_ai_logic(self, content):
+        try:
+            genai.configure(api_key="AIzaSyBbWVgkn9zUUBuJu7MNKgV6JIfFcu3oBbA") 
+            
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            
+            prompt = f"Hãy tóm tắt nội dung sau đây một cách ngắn gọn, súc tích bằng tiếng Việt (khoảng 3-5 ý chính):\n\n{content[:8000]}" 
+            
+            response = model.generate_content(prompt)
+            
+            if response.text:
+                self.show_ai_result(response.text)
+                self.status_label.configure(text="✨ AI: Tóm tắt hoàn tất!")
+            else:
+                messagebox.showwarning("AI", "AI không trả về nội dung, thử lại file khác xem.")
+                
+        except Exception as e:
+            error_msg = str(e)
+            messagebox.showerror("Lỗi AI", f"Chi tiết lỗi: {error_msg}")
+            self.status_label.configure(text="Lỗi kết nối AI.")
+
+    def show_ai_result(self, text):
+        top = ctk.CTkToplevel(self)
+        top.title("Kết quả tóm tắt AI")
+        top.geometry("600x400")
+        top.attributes("-topmost", True)
+
+        txt_area = ctk.CTkTextbox(top, font=("Segoe UI", 13), corner_radius=10)
+        txt_area.pack(padx=20, pady=20, fill="both", expand=True)
+        txt_area.insert("0.0", text)
+        txt_area.configure(state="disabled")
 
 if __name__ == "__main__":
     app = App()
